@@ -1,0 +1,15 @@
+name: 构建与测试
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装构建依赖
+        run: sudo apt-get update && sudo apt-get install -y g++-multilib curl python3
+      - name: 运行 32/64 位测试
+        run: make -j2 check
