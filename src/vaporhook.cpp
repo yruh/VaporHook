@@ -4,14 +4,13 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -31,7 +30,8 @@
 namespace {
 
 constexpr std::size_t kMinimumPatchSize = 5;
-constexpr std::size_t kMaximumOverwriteSize = 64;
+// The patch block plus the pop that may follow a 32-bit call/pop pair.
+constexpr std::size_t kDecodeWindow = kMinimumPatchSize + 2 * ZYDIS_MAX_INSTRUCTION_LENGTH;
 constexpr std::size_t kRelaySize = 14;
 constexpr std::size_t kErrorMessageSize = 256;
 
@@ -67,9 +67,8 @@ struct DecodedRecord {
 struct HookEntry {
     void *target{nullptr};
     void *detour{nullptr};
-    void *mapping{nullptr};
+    void *mapping{nullptr}; // also the trampoline entry point
     std::size_t mapping_size{0};
-    void *trampoline{nullptr};
     std::size_t patch_size{0};
     std::vector<std::uint8_t> original_bytes;
     std::vector<std::uint8_t> patch_bytes;
@@ -79,7 +78,7 @@ struct HookEntry {
     HookEntry &operator=(const HookEntry &) = delete;
 
     ~HookEntry() {
-        if (mapping != nullptr && mapping_size != 0) {
+        if (mapping != nullptr) {
             ::munmap(mapping, mapping_size);
         }
     }
@@ -107,31 +106,16 @@ std::uintptr_t align_down(std::uintptr_t value, std::size_t alignment) {
     return value & ~(static_cast<std::uintptr_t>(alignment) - 1U);
 }
 
-std::optional<std::uintptr_t> align_up(std::uintptr_t value, std::size_t alignment) {
+// Inputs are addresses inside mapped user-space pages and page ends are already aligned, so
+// the additions below cannot wrap.
+std::uintptr_t align_up(std::uintptr_t value, std::size_t alignment) {
     const std::uintptr_t mask = static_cast<std::uintptr_t>(alignment) - 1U;
-    if (value > std::numeric_limits<std::uintptr_t>::max() - mask) {
-        return std::nullopt;
-    }
     return (value + mask) & ~mask;
 }
 
 bool ranges_overlap(std::uintptr_t first_start, std::size_t first_size,
                     std::uintptr_t second_start, std::size_t second_size) {
-    if (first_size == 0 || second_size == 0) {
-        return false;
-    }
-    if (first_start > std::numeric_limits<std::uintptr_t>::max() - first_size ||
-        second_start > std::numeric_limits<std::uintptr_t>::max() - second_size) {
-        return true;
-    }
     return first_start < second_start + second_size && second_start < first_start + first_size;
-}
-
-std::optional<std::uintptr_t> checked_address_add(std::uintptr_t address, std::size_t size) {
-    if (address > std::numeric_limits<std::uintptr_t>::max() - size) {
-        return std::nullopt;
-    }
-    return address + size;
 }
 
 bool displacement_fits_rel32(std::uintptr_t from_after, std::uintptr_t to) {
@@ -173,15 +157,19 @@ bool read_process_maps(std::vector<MemoryMap> &maps) {
         return false;
     }
 
-    std::array<char, 4096> line{};
-    while (std::fgets(line.data(), static_cast<int>(line.size()), file) != nullptr) {
+    // getline instead of a fixed buffer: a mapped path can approach PATH_MAX, which would split
+    // the line and make the continuation fail to parse.
+    char *line = nullptr;
+    std::size_t capacity = 0;
+    bool ok = true;
+    while (::getline(&line, &capacity, file) != -1) {
         unsigned long long start = 0;
         unsigned long long end = 0;
         std::array<char, 5> permissions{};
-        if (std::sscanf(line.data(), "%llx-%llx %4s", &start, &end, permissions.data()) != 3 ||
+        if (std::sscanf(line, "%llx-%llx %4s", &start, &end, permissions.data()) != 3 ||
             start >= end) {
-            std::fclose(file);
-            return false;
+            ok = false;
+            break;
         }
         int prot = PROT_NONE;
         if (permissions[0] == 'r') {
@@ -195,7 +183,8 @@ bool read_process_maps(std::vector<MemoryMap> &maps) {
         }
         maps.push_back({static_cast<std::uintptr_t>(start), static_cast<std::uintptr_t>(end), prot});
     }
-    const bool ok = std::ferror(file) == 0;
+    ok = ok && std::ferror(file) == 0;
+    std::free(line);
     std::fclose(file);
     return ok;
 }
@@ -210,34 +199,20 @@ const MemoryMap *find_mapping(const std::vector<MemoryMap> &maps, std::uintptr_t
     return &*iterator;
 }
 
-bool query_pages(std::uintptr_t address, std::size_t size, bool require_strict_rx,
-                 std::vector<std::uintptr_t> &pages) {
-    if (size == 0 || address > std::numeric_limits<std::uintptr_t>::max() - size) {
-        return false;
-    }
+// Collects the pages covering [address, address + size); each must be exactly r-x.
+bool query_strict_rx_pages(std::uintptr_t address, std::size_t size,
+                           std::vector<std::uintptr_t> &pages) {
     std::vector<MemoryMap> maps;
     if (!read_process_maps(maps)) {
         return false;
     }
 
     const std::size_t page_size = system_page_size();
-    const std::uintptr_t first = align_down(address, page_size);
-    const auto aligned_end = align_up(address + size, page_size);
-    if (!aligned_end.has_value() || *aligned_end <= first) {
-        return false;
-    }
-
-    for (std::uintptr_t page = first; page < *aligned_end; page += page_size) {
+    const std::uintptr_t aligned_end = align_up(address + size, page_size);
+    for (std::uintptr_t page = align_down(address, page_size); page < aligned_end;
+         page += page_size) {
         const MemoryMap *mapping = find_mapping(maps, page);
-        if (mapping == nullptr || mapping->end - page < page_size) {
-            return false;
-        }
-        if (require_strict_rx) {
-            if (mapping->prot != (PROT_READ | PROT_EXEC)) {
-                return false;
-            }
-        } else if ((mapping->prot & (PROT_READ | PROT_EXEC)) !=
-                   (PROT_READ | PROT_EXEC)) {
+        if (mapping == nullptr || mapping->prot != (PROT_READ | PROT_EXEC)) {
             return false;
         }
         pages.push_back(page);
@@ -278,13 +253,10 @@ void *allocate_trampoline_mapping(std::uintptr_t target, std::size_t size) {
     const std::size_t page_size = system_page_size();
     const std::uintptr_t reach = static_cast<std::uintptr_t>(INT32_MAX);
     const std::uintptr_t low = target > reach ? target - reach : page_size;
-    const std::uintptr_t high =
-        target < std::numeric_limits<std::uintptr_t>::max() - reach
-            ? target + reach
-            : std::numeric_limits<std::uintptr_t>::max() - size;
+    const std::uintptr_t high = target + reach;
 
     std::vector<std::uintptr_t> candidates;
-    std::uintptr_t cursor = align_up(low, page_size).value_or(low);
+    std::uintptr_t cursor = align_up(low, page_size);
     for (const MemoryMap &mapping : maps) {
         if (mapping.end <= cursor) {
             continue;
@@ -307,12 +279,7 @@ void *allocate_trampoline_mapping(std::uintptr_t target, std::size_t size) {
                 candidates.push_back(candidate);
             }
         }
-        cursor = std::max(cursor, mapping.end);
-        const auto aligned = align_up(cursor, page_size);
-        if (!aligned.has_value()) {
-            break;
-        }
-        cursor = *aligned;
+        cursor = align_up(std::max(cursor, mapping.end), page_size);
     }
     if (cursor < high && high - cursor >= size) {
         candidates.push_back(target >= cursor ? align_down(std::min(target, high - size), page_size)
@@ -420,7 +387,7 @@ vaporhook_status_t decode_target(std::uintptr_t target, std::vector<DecodedRecor
     if (!readable_bytes_available(target, &available)) {
         return VAPORHOOK_ERROR_TARGET_MAPPING;
     }
-    available = std::min(available, kMaximumOverwriteSize + ZYDIS_MAX_INSTRUCTION_LENGTH);
+    available = std::min(available, kDecodeWindow);
 
     ZydisDecoder decoder{};
     const ZydisMachineMode mode =
@@ -433,7 +400,7 @@ vaporhook_status_t decode_target(std::uintptr_t target, std::vector<DecodedRecor
 
     patch_size = 0;
     while (patch_size < kMinimumPatchSize) {
-        if (patch_size >= available || patch_size > kMaximumOverwriteSize) {
+        if (patch_size >= available) {
             return VAPORHOOK_ERROR_DECODE;
         }
         DecodedRecord record{};
@@ -442,13 +409,10 @@ vaporhook_status_t decode_target(std::uintptr_t target, std::vector<DecodedRecor
         const ZyanStatus status = ZydisDecoderDecodeFull(
             &decoder, reinterpret_cast<const void *>(record.original_address), available - patch_size,
             &record.instruction, record.operands.data());
-        if (ZYAN_FAILED(status) || record.instruction.length == 0) {
+        if (ZYAN_FAILED(status)) {
             return VAPORHOOK_ERROR_DECODE;
         }
         patch_size += record.instruction.length;
-        if (patch_size > kMaximumOverwriteSize) {
-            return VAPORHOOK_ERROR_DECODE;
-        }
         records.push_back(record);
     }
 
@@ -466,7 +430,7 @@ vaporhook_status_t decode_target(std::uintptr_t target, std::vector<DecodedRecor
             const ZyanStatus status = ZydisDecoderDecodeFull(
                 &decoder, reinterpret_cast<const void *>(pop.original_address), available - patch_size,
                 &pop.instruction, pop.operands.data());
-            if (ZYAN_FAILED(status) || pop.instruction.length == 0) {
+            if (ZYAN_FAILED(status)) {
                 return VAPORHOOK_ERROR_DECODE;
             }
             patch_size += pop.instruction.length;
@@ -514,8 +478,7 @@ std::optional<std::size_t> internal_target_index(const std::vector<DecodedRecord
                                                  std::uintptr_t block_start,
                                                  std::size_t block_size,
                                                  std::uintptr_t address) {
-    const auto block_end = checked_address_add(block_start, block_size);
-    if (!block_end.has_value() || address < block_start || address >= *block_end) {
+    if (address < block_start || address >= block_start + block_size) {
         return std::nullopt;
     }
     for (std::size_t index = 0; index < records.size(); ++index) {
@@ -605,11 +568,7 @@ vaporhook_status_t encode_record(const DecodedRecord &record,
                                                     record.original_address, &absolute))) {
                 return VAPORHOOK_ERROR_RELOCATION;
             }
-            const auto block_end = checked_address_add(block_start, block_size);
-            if (!block_end.has_value()) {
-                return VAPORHOOK_ERROR_RELOCATION;
-            }
-            if (absolute >= block_start && absolute < *block_end) {
+            if (absolute >= block_start && absolute < block_start + block_size) {
                 return VAPORHOOK_ERROR_UNSUPPORTED_INSTRUCTION;
             }
             request.operands[index].mem.displacement = static_cast<ZyanI64>(absolute);
@@ -715,8 +674,9 @@ struct MappingGuard {
 
 } // namespace
 
+// Callers serialize every call on one engine (see vaporhook.h), so the engine carries no lock.
+// Only the process-wide target registry is shared between engines.
 struct vaporhook_engine {
-    mutable std::mutex mutex;
     EngineState state{EngineState::Empty};
     std::vector<std::unique_ptr<HookEntry>> entries;
     std::array<char, kErrorMessageSize> error{};
@@ -783,7 +743,6 @@ vaporhook_status_t prepare_entry(vaporhook_engine &engine, void *target_ptr, voi
     std::unique_ptr<HookEntry> entry = std::make_unique<HookEntry>();
     entry->target = target_ptr;
     entry->detour = detour_ptr;
-    entry->trampoline = mapping;
     entry->patch_size = patch_size;
     entry->original_bytes.resize(patch_size);
     entry->patch_bytes.assign(patch_size, 0x90);
@@ -823,7 +782,7 @@ vaporhook_status_t apply_entry_bytes(HookEntry &entry, const std::vector<std::ui
                                      bool *inconsistent_out) {
     std::vector<std::uintptr_t> pages;
     const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(entry.target);
-    if (!query_pages(target, entry.patch_size, true, pages)) {
+    if (!query_strict_rx_pages(target, entry.patch_size, pages)) {
         return VAPORHOOK_ERROR_TARGET_PERMISSIONS;
     }
 
@@ -870,7 +829,7 @@ vaporhook_status_t apply_entry_bytes(HookEntry &entry, const std::vector<std::ui
 bool preflight_entry(const HookEntry &entry) {
     std::vector<std::uintptr_t> pages;
     const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(entry.target);
-    return query_pages(target, entry.patch_size, true, pages) &&
+    return query_strict_rx_pages(target, entry.patch_size, pages) &&
            std::memcmp(entry.target, entry.original_bytes.data(), entry.patch_size) == 0;
 }
 
@@ -907,7 +866,6 @@ extern "C" vaporhook_status_t vaporhook_prepare(vaporhook_engine_t *engine, void
     *trampoline_out = nullptr;
 
     try {
-        std::lock_guard engine_lock(engine->mutex);
         if (engine->state == EngineState::Installed || engine->state == EngineState::Inconsistent) {
             return set_error(*engine, VAPORHOOK_ERROR_INVALID_STATE,
                              "prepare requires an empty or prepared engine");
@@ -916,12 +874,7 @@ extern "C" vaporhook_status_t vaporhook_prepare(vaporhook_engine_t *engine, void
             return set_error(*engine, VAPORHOOK_ERROR_TOO_MANY_HOOKS,
                              "an engine supports at most %d hooks", VAPORHOOK_MAX_HOOKS);
         }
-        for (const auto &entry : engine->entries) {
-            if (entry->target == target) {
-                return set_error(*engine, VAPORHOOK_ERROR_DUPLICATE_TARGET,
-                                 "target %p is already prepared", target);
-            }
-        }
+        // Reserve first so the push_back after registration cannot throw.
         engine->entries.reserve(engine->entries.size() + 1);
 
         std::unique_ptr<HookEntry> entry;
@@ -930,39 +883,25 @@ extern "C" vaporhook_status_t vaporhook_prepare(vaporhook_engine_t *engine, void
             return prepared;
         }
 
+        // The registry holds every prepared range of every engine, so this one check covers
+        // duplicates and overlaps both within this engine and across engines.
         const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(target);
-        for (const auto &existing : engine->entries) {
-            if (ranges_overlap(start, entry->patch_size,
-                               reinterpret_cast<std::uintptr_t>(existing->target),
-                               existing->patch_size)) {
+        ProcessRegistry &registry = process_registry();
+        std::lock_guard registry_lock(registry.mutex);
+        for (const auto &[registered_start, registered_size] : registry.target_ranges) {
+            if (registered_start == start) {
+                return set_error(*engine, VAPORHOOK_ERROR_DUPLICATE_TARGET,
+                                 "target %p is already hooked", target);
+            }
+            if (ranges_overlap(start, entry->patch_size, registered_start, registered_size)) {
                 return set_error(*engine, VAPORHOOK_ERROR_OVERLAPPING_TARGET,
                                  "target range at %p overlaps an existing hook", target);
             }
         }
+        registry.target_ranges.emplace(start, entry->patch_size);
 
-        ProcessRegistry &registry = process_registry();
-        std::lock_guard registry_lock(registry.mutex);
-        for (const auto &[registered_start, registered_size] : registry.target_ranges) {
-            if (ranges_overlap(start, entry->patch_size, registered_start, registered_size)) {
-                return set_error(*engine, VAPORHOOK_ERROR_DUPLICATE_TARGET,
-                                 "target range at %p is owned by another engine", target);
-            }
-        }
-        const auto [registration, inserted] =
-            registry.target_ranges.emplace(start, entry->patch_size);
-        if (!inserted) {
-            return set_error(*engine, VAPORHOOK_ERROR_DUPLICATE_TARGET,
-                             "target range at %p is already registered", target);
-        }
-
-        void *const trampoline = entry->trampoline;
-        try {
-            engine->entries.push_back(std::move(entry));
-        } catch (...) {
-            registry.target_ranges.erase(registration);
-            throw;
-        }
-        *trampoline_out = trampoline;
+        *trampoline_out = entry->mapping;
+        engine->entries.push_back(std::move(entry));
         engine->state = EngineState::Prepared;
         clear_error(*engine);
         return VAPORHOOK_SUCCESS;
@@ -978,12 +917,13 @@ extern "C" vaporhook_status_t vaporhook_install(vaporhook_engine_t *engine) {
         return VAPORHOOK_ERROR_INVALID_ARGUMENT;
     }
     try {
-        std::lock_guard engine_lock(engine->mutex);
         if (engine->state != EngineState::Prepared || engine->entries.empty()) {
             return set_error(*engine, VAPORHOOK_ERROR_INVALID_STATE,
                              "install requires at least one prepared hook");
         }
 
+        // Held while patching so two engines never flip protections on a shared code page
+        // concurrently (one restoring r-x while the other is still writing).
         ProcessRegistry &registry = process_registry();
         std::lock_guard registry_lock(registry.mutex);
         for (const auto &entry : engine->entries) {
@@ -1038,7 +978,6 @@ extern "C" vaporhook_status_t vaporhook_uninstall(vaporhook_engine_t *engine) {
         return VAPORHOOK_ERROR_INVALID_ARGUMENT;
     }
     try {
-        std::lock_guard engine_lock(engine->mutex);
         if (engine->state != EngineState::Installed) {
             return set_error(*engine, VAPORHOOK_ERROR_INVALID_STATE,
                              "uninstall requires an installed engine");
@@ -1071,12 +1010,10 @@ extern "C" vaporhook_status_t vaporhook_uninstall(vaporhook_engine_t *engine) {
         clear_error(*engine);
         return VAPORHOOK_SUCCESS;
     } catch (const std::bad_alloc &) {
-        std::lock_guard lock(engine->mutex);
         engine->state = EngineState::Inconsistent;
         return set_error(*engine, VAPORHOOK_ERROR_NO_MEMORY,
                          "allocation failed during uninstall; trampolines retained");
     } catch (...) {
-        std::lock_guard lock(engine->mutex);
         engine->state = EngineState::Inconsistent;
         return set_error(*engine, VAPORHOOK_ERROR_PATCH,
                          "unexpected uninstall failure; trampolines retained");
@@ -1088,7 +1025,6 @@ extern "C" vaporhook_status_t vaporhook_destroy(vaporhook_engine_t *engine) {
         return VAPORHOOK_ERROR_INVALID_ARGUMENT;
     }
 
-    std::unique_lock engine_lock(engine->mutex);
     if (engine->state == EngineState::Installed) {
         return set_error(*engine, VAPORHOOK_ERROR_INVALID_STATE,
                          "installed engines must be uninstalled before destroy");
@@ -1105,7 +1041,6 @@ extern "C" vaporhook_status_t vaporhook_destroy(vaporhook_engine_t *engine) {
             registry.target_ranges.erase(reinterpret_cast<std::uintptr_t>(entry->target));
         }
     }
-    engine_lock.unlock();
     delete engine;
     return VAPORHOOK_SUCCESS;
 }
@@ -1114,7 +1049,6 @@ extern "C" vaporhook_state_t vaporhook_state(const vaporhook_engine_t *engine) {
     if (engine == nullptr) {
         return VAPORHOOK_STATE_INCONSISTENT;
     }
-    std::lock_guard lock(engine->mutex);
     return public_state(engine->state);
 }
 
@@ -1122,7 +1056,6 @@ extern "C" size_t vaporhook_hook_count(const vaporhook_engine_t *engine) {
     if (engine == nullptr) {
         return 0;
     }
-    std::lock_guard lock(engine->mutex);
     return engine->entries.size();
 }
 
@@ -1130,7 +1063,6 @@ extern "C" const char *vaporhook_error_message(const vaporhook_engine_t *engine)
     if (engine == nullptr) {
         return "invalid engine";
     }
-    std::lock_guard lock(engine->mutex);
     return engine->error.data();
 }
 
